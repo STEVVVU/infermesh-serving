@@ -1,0 +1,6 @@
+/target/
+/.tmp/*
+!/.tmp/.gitkeep
+__pycache__/
+*.py[cod]
+.venv/

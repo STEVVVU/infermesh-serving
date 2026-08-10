@@ -1,0 +1,18 @@
+{
+  "name": "token-echo",
+  "platform": "infermesh_cpu",
+  "backend": "deterministic_cpu",
+  "max_batch_size": 8,
+  "max_queue_delay_us": 3000,
+  "queue_capacity": 128,
+  "default_timeout_us": 1000000,
+  "llm": true,
+  "cache_blocks": 128,
+  "cache_block_tokens": 16,
+  "inputs": [
+    {"name": "TOKENS", "datatype": "INT64", "shape": [-1, -1]}
+  ],
+  "outputs": [
+    {"name": "TOKENS", "datatype": "INT64", "shape": [-1, -1]}
+  ]
+}

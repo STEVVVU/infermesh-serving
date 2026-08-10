@@ -1,0 +1,17 @@
+{
+  "name": "adder",
+  "platform": "infermesh_cpu",
+  "backend": "deterministic_cpu",
+  "max_batch_size": 16,
+  "max_queue_delay_us": 2000,
+  "queue_capacity": 256,
+  "default_timeout_us": 500000,
+  "llm": false,
+  "inputs": [
+    {"name": "INPUT0", "datatype": "FP64", "shape": [-1, 1]},
+    {"name": "INPUT1", "datatype": "FP64", "shape": [-1, 1]}
+  ],
+  "outputs": [
+    {"name": "OUTPUT0", "datatype": "FP64", "shape": [-1, 1]}
+  ]
+}
