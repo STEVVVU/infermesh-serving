@@ -121,6 +121,12 @@ impl InferRequest {
                     format!("input {} data must be a JSON array", input.name),
                 ));
             }
+            if input.data.as_array().map(Vec::len) != elements {
+                return Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    format!("input {} data length does not match shape", input.name),
+                ));
+            }
         }
         Ok(())
     }

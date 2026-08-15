@@ -200,6 +200,18 @@ impl WorkerRegistry {
         }
         expired
     }
+
+    #[must_use]
+    pub fn supports_model(&self, model: &ModelKey) -> bool {
+        let now = self.clock.now_ms();
+        self.workers
+            .lock()
+            .expect("registry lock poisoned")
+            .values()
+            .any(|worker| {
+                worker.lease_expires_ms > now && worker.registration.models.contains(model)
+            })
+    }
 }
 
 #[cfg(test)]
