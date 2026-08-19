@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use infermesh::engine::{DeterministicCpuEngine, Dispatcher, EngineDirectory};
+use infermesh::engine::{
+    DeterministicCpuEngine, Dispatcher, Engine, EngineDirectory, ProcessEngine,
+};
 use infermesh::metrics::Metrics;
 use infermesh::registry::{WorkerRegistration, WorkerRegistry};
 use infermesh::repository::ModelRepository;
@@ -44,13 +46,32 @@ fn run() -> infermesh::Result<()> {
         .into_iter()
         .map(|model| model.key)
         .collect::<BTreeSet<_>>();
+    let engine_mode = env::var("INFERMESH_ENGINE").unwrap_or_else(|_| "rust-cpu".to_owned());
     for worker_id in ["local-cpu-0", "local-cpu-1"] {
         registry.register(WorkerRegistration {
             id: worker_id.to_owned(),
             capacity: 4,
             models: models.clone(),
         })?;
-        engines.register(worker_id, Arc::new(DeterministicCpuEngine::default()));
+        let engine: Arc<dyn Engine> = match engine_mode.as_str() {
+            "python-cpu" => Arc::new(ProcessEngine::spawn(
+                "python",
+                "cpu",
+                Duration::from_secs(30),
+            )?),
+            "python-onnx" => Arc::new(ProcessEngine::spawn(
+                "python",
+                "onnxruntime",
+                Duration::from_secs(30),
+            )?),
+            "python-torch" => Arc::new(ProcessEngine::spawn(
+                "python",
+                "torch",
+                Duration::from_secs(30),
+            )?),
+            _ => Arc::new(DeterministicCpuEngine::default()),
+        };
+        engines.register(worker_id, engine);
     }
 
     let dispatcher = Arc::new(Dispatcher::new(

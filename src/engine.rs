@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::metrics::Metrics;
@@ -30,6 +34,191 @@ pub trait Engine: Send + Sync {
         model: &LoadedModel,
         requests: &[InferRequest],
     ) -> std::result::Result<Vec<InferResponse>, EngineFailure>;
+}
+
+const ENGINE_PROTOCOL: &str = "infermesh-engine/1";
+
+struct ProcessState {
+    child: Child,
+    stdin: ChildStdin,
+    responses: Receiver<String>,
+}
+
+impl Drop for ProcessState {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub struct ProcessEngine {
+    state: Mutex<ProcessState>,
+    timeout: Duration,
+    next_request_id: AtomicUsize,
+}
+
+#[derive(Deserialize)]
+struct WorkerResponse {
+    protocol: String,
+    request_id: String,
+    status: String,
+    #[serde(default)]
+    responses: Vec<InferResponse>,
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    execution_started: bool,
+}
+
+impl ProcessEngine {
+    pub fn spawn(python: &str, backend: &str, timeout: Duration) -> Result<Self> {
+        let python_path = std::env::current_dir()?.join("python");
+        let mut child = Command::new(python)
+            .args(["-m", "infermesh_worker.worker", "--backend", backend])
+            .env("PYTHONPATH", python_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| {
+                Error::new(
+                    ErrorCode::Unavailable,
+                    format!("failed to start Python worker: {error}"),
+                )
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::new(ErrorCode::Internal, "worker stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::new(ErrorCode::Internal, "worker stdout unavailable"))?;
+        let (sender, responses) = mpsc::channel();
+        thread::Builder::new()
+            .name(format!("python-{backend}-responses"))
+            .spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else {
+                        break;
+                    };
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|error| {
+                Error::new(
+                    ErrorCode::Internal,
+                    format!("failed to start worker response reader: {error}"),
+                )
+            })?;
+        Ok(Self {
+            state: Mutex::new(ProcessState {
+                child,
+                stdin,
+                responses,
+            }),
+            timeout,
+            next_request_id: AtomicUsize::new(1),
+        })
+    }
+}
+
+impl Engine for ProcessEngine {
+    fn execute(
+        &self,
+        model: &LoadedModel,
+        requests: &[InferRequest],
+    ) -> std::result::Result<Vec<InferResponse>, EngineFailure> {
+        let request_id = self
+            .next_request_id
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        let envelope = json!({
+            "protocol": ENGINE_PROTOCOL,
+            "request_id": request_id,
+            "model": {
+                "name": model.key.name,
+                "version": model.key.version,
+                "directory": model.directory,
+                "backend": model.config.backend,
+            },
+            "requests": requests,
+        });
+        let mut encoded = serde_json::to_vec(&envelope).map_err(|error| EngineFailure {
+            phase: FailurePhase::PreExecution,
+            message: error.to_string(),
+        })?;
+        encoded.push(b'\n');
+        let mut state = self.state.lock().expect("process engine lock poisoned");
+        if state
+            .child
+            .try_wait()
+            .map_err(|error| EngineFailure {
+                phase: FailurePhase::PreExecution,
+                message: error.to_string(),
+            })?
+            .is_some()
+        {
+            return Err(EngineFailure {
+                phase: FailurePhase::PreExecution,
+                message: "Python worker exited before request dispatch".to_owned(),
+            });
+        }
+        state
+            .stdin
+            .write_all(&encoded)
+            .and_then(|()| state.stdin.flush())
+            .map_err(|error| EngineFailure {
+                phase: FailurePhase::PreExecution,
+                message: format!("failed to send request to Python worker: {error}"),
+            })?;
+        let line = match state.responses.recv_timeout(self.timeout) {
+            Ok(line) => line,
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = state.child.kill();
+                return Err(EngineFailure {
+                    phase: FailurePhase::PostExecution,
+                    message: "Python worker response timeout; process terminated".to_owned(),
+                });
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(EngineFailure {
+                    phase: FailurePhase::PostExecution,
+                    message: "Python worker response stream closed".to_owned(),
+                });
+            }
+        };
+        let response: WorkerResponse =
+            serde_json::from_str(&line).map_err(|error| EngineFailure {
+                phase: FailurePhase::PostExecution,
+                message: format!("invalid Python worker response: {error}"),
+            })?;
+        if response.protocol != ENGINE_PROTOCOL || response.request_id != request_id {
+            return Err(EngineFailure {
+                phase: FailurePhase::PostExecution,
+                message: "Python worker protocol/request id mismatch".to_owned(),
+            });
+        }
+        if response.status != "ok" {
+            return Err(EngineFailure {
+                phase: if response.execution_started {
+                    FailurePhase::PostExecution
+                } else {
+                    FailurePhase::PreExecution
+                },
+                message: response.error,
+            });
+        }
+        if response.responses.len() != requests.len() {
+            return Err(EngineFailure {
+                phase: FailurePhase::PostExecution,
+                message: "Python worker response count mismatch".to_owned(),
+            });
+        }
+        Ok(response.responses)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -280,7 +469,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{DeterministicCpuEngine, Dispatcher, EngineDirectory};
+    use super::{DeterministicCpuEngine, Dispatcher, Engine, EngineDirectory, ProcessEngine};
     use crate::metrics::Metrics;
     use crate::protocol::{InferRequest, InferTensor, TensorMetadata};
     use crate::registry::{WorkerRegistration, WorkerRegistry};
@@ -359,5 +548,14 @@ mod tests {
         assert!(result.retried);
         assert_eq!(result.worker_id, "b");
         assert_eq!(result.responses[0].outputs[0].data, json!([5.0]));
+    }
+
+    #[test]
+    fn python_cpu_process_implements_engine_protocol() {
+        let engine =
+            ProcessEngine::spawn("python", "cpu", std::time::Duration::from_secs(5)).unwrap();
+        let responses = engine.execute(&model(), &[request()]).unwrap();
+        assert_eq!(responses[0].outputs[0].data, json!([5.0]));
+        assert_eq!(responses[0].parameters["backend"], json!("python_cpu"));
     }
 }
