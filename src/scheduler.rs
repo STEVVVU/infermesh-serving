@@ -396,9 +396,10 @@ fn validate_model_inputs(model: &LoadedModel, request: &InferRequest) -> Result<
 mod tests {
     use std::collections::BTreeSet;
     use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Barrier};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use serde_json::json;
 
@@ -408,6 +409,28 @@ mod tests {
     use crate::protocol::{InferRequest, InferTensor, TensorMetadata};
     use crate::registry::{WorkerRegistration, WorkerRegistry};
     use crate::repository::{LoadedModel, ModelConfig, ModelKey};
+
+    struct BlockingEngine {
+        started: mpsc::Sender<()>,
+        releases: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl crate::engine::Engine for BlockingEngine {
+        fn execute(
+            &self,
+            model: &LoadedModel,
+            requests: &[InferRequest],
+        ) -> std::result::Result<Vec<crate::protocol::InferResponse>, crate::engine::EngineFailure>
+        {
+            let _ = self.started.send(());
+            self.releases
+                .lock()
+                .expect("release lock poisoned")
+                .recv()
+                .expect("test releases execution");
+            crate::engine::Engine::execute(&DeterministicCpuEngine::default(), model, requests)
+        }
+    }
 
     fn model(queue_delay_us: u64, queue_capacity: usize) -> LoadedModel {
         LoadedModel {
@@ -459,11 +482,10 @@ mod tests {
         }
     }
 
-    fn batcher(
+    fn batcher_for(
+        model: LoadedModel,
         engine: Arc<dyn crate::engine::Engine>,
-        queue_delay_us: u64,
     ) -> (Arc<DynamicBatcher>, Arc<Metrics>) {
-        let model = model(queue_delay_us, 8);
         let registry = Arc::new(WorkerRegistry::new(60_000));
         registry
             .register(WorkerRegistration {
@@ -482,9 +504,17 @@ mod tests {
         )
     }
 
+    fn batcher(
+        engine: Arc<dyn crate::engine::Engine>,
+        queue_delay_us: u64,
+        queue_capacity: usize,
+    ) -> (Arc<DynamicBatcher>, Arc<Metrics>) {
+        batcher_for(model(queue_delay_us, queue_capacity), engine)
+    }
+
     #[test]
     fn compatible_requests_share_one_dynamic_batch() {
-        let (batcher, metrics) = batcher(Arc::new(DeterministicCpuEngine::default()), 50_000);
+        let (batcher, metrics) = batcher(Arc::new(DeterministicCpuEngine::default()), 50_000, 8);
         let barrier = Arc::new(Barrier::new(3));
         let mut threads = Vec::new();
         for id in ["one", "two"] {
@@ -508,10 +538,82 @@ mod tests {
 
     #[test]
     fn execution_past_request_deadline_is_not_returned() {
-        let (batcher, metrics) = batcher(Arc::new(DeterministicCpuEngine::with_delay(50_000)), 1);
+        let (batcher, metrics) =
+            batcher(Arc::new(DeterministicCpuEngine::with_delay(50_000)), 1, 8);
         let error = batcher
             .submit(request("late"), Duration::from_millis(5), &metrics)
             .unwrap_err();
         assert_eq!(error.code, crate::ErrorCode::DeadlineExceeded);
+    }
+
+    #[test]
+    fn bounded_queue_rejects_when_worker_and_admission_are_saturated() {
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let engine = Arc::new(BlockingEngine {
+            started: started_sender,
+            releases: Mutex::new(release_receiver),
+        });
+        let (batcher, metrics) = batcher(engine, 1, 1);
+        let first_batcher = Arc::clone(&batcher);
+        let first_metrics = Arc::clone(&metrics);
+        let first = thread::spawn(move || {
+            first_batcher.submit(request("first"), Duration::from_secs(1), &first_metrics)
+        });
+        started_receiver.recv().unwrap();
+        let (second_sender, second_receiver) = mpsc::channel();
+        batcher
+            .sender
+            .try_send(super::QueuedRequest {
+                request: request("second"),
+                enqueued: Instant::now(),
+                deadline: Instant::now() + Duration::from_secs(1),
+                response: second_sender,
+            })
+            .unwrap();
+        let error = batcher
+            .submit(request("rejected"), Duration::from_secs(1), &metrics)
+            .unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::ResourceExhausted);
+        release_sender.send(()).unwrap();
+        started_receiver.recv().unwrap();
+        release_sender.send(()).unwrap();
+        assert!(first.join().unwrap().is_ok());
+        assert!(second_receiver.recv().unwrap().is_ok());
+        assert_eq!(metrics.admission_rejected_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn llm_scheduler_reuses_prefix_cache_between_requests() {
+        let mut llm_model = model(1, 8);
+        llm_model.key.name = "token-echo".to_owned();
+        llm_model.config.name = "token-echo".to_owned();
+        llm_model.config.llm = true;
+        llm_model.config.cache_blocks = 8;
+        llm_model.config.cache_block_tokens = 4;
+        let (batcher, metrics) =
+            batcher_for(llm_model, Arc::new(DeterministicCpuEngine::default()));
+        let llm_request = || InferRequest {
+            id: "llm".to_owned(),
+            parameters: std::collections::BTreeMap::from([(
+                "prefix_tokens".to_owned(),
+                json!([1, 2, 3, 4]),
+            )]),
+            inputs: vec![InferTensor {
+                name: "TOKENS".to_owned(),
+                shape: vec![1, 4],
+                datatype: "INT64".to_owned(),
+                data: json!([1, 2, 3, 4]),
+            }],
+            outputs: Vec::new(),
+        };
+        batcher
+            .submit(llm_request(), Duration::from_secs(1), &metrics)
+            .unwrap();
+        batcher
+            .submit(llm_request(), Duration::from_secs(1), &metrics)
+            .unwrap();
+        assert_eq!(metrics.cache_misses_total.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.cache_hits_total.load(Ordering::Relaxed), 1);
     }
 }

@@ -41,6 +41,11 @@ impl App {
 
 pub fn serve(bind: &str, app: Arc<App>) -> Result<()> {
     let listener = TcpListener::bind(bind)?;
+    serve_listener(listener, app)
+}
+
+pub fn serve_listener(listener: TcpListener, app: Arc<App>) -> Result<()> {
+    let bind = listener.local_addr()?.to_string();
     listener.set_nonblocking(true)?;
     structured_log(
         "server_started",
@@ -62,7 +67,10 @@ pub fn serve(bind: &str, app: Arc<App>) -> Result<()> {
 
     while !app.shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, _)) => admit_connection(&sender, stream),
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                admit_connection(&sender, stream);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
             }
