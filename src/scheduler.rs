@@ -616,4 +616,33 @@ mod tests {
         assert_eq!(metrics.cache_misses_total.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.cache_hits_total.load(Ordering::Relaxed), 1);
     }
+
+    #[test]
+    fn incompatible_non_batch_shapes_are_dispatched_separately() {
+        let (batcher, metrics) = batcher(Arc::new(DeterministicCpuEngine::default()), 50_000, 8);
+        let barrier = Arc::new(Barrier::new(3));
+        let mut wide = request("wide");
+        for input in &mut wide.inputs {
+            input.shape = vec![1, 2];
+            input.data = json!([2.0, 3.0]);
+        }
+        let requests = [request("narrow"), wide];
+        let mut threads = Vec::new();
+        for request in requests {
+            let batcher = Arc::clone(&batcher);
+            let metrics = Arc::clone(&metrics);
+            let barrier = Arc::clone(&barrier);
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                batcher
+                    .submit(request, Duration::from_secs(1), &metrics)
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(metrics.batches_total.load(Ordering::Relaxed), 2);
+    }
 }

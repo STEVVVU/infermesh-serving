@@ -465,11 +465,15 @@ impl Dispatcher {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     use serde_json::json;
 
-    use super::{DeterministicCpuEngine, Dispatcher, Engine, EngineDirectory, ProcessEngine};
+    use super::{
+        DeterministicCpuEngine, Dispatcher, Engine, EngineDirectory, EngineFailure, FailurePhase,
+        ProcessEngine,
+    };
     use crate::metrics::Metrics;
     use crate::protocol::{InferRequest, InferTensor, TensorMetadata};
     use crate::registry::{WorkerRegistration, WorkerRegistry};
@@ -557,5 +561,45 @@ mod tests {
         let responses = engine.execute(&model(), &[request()]).unwrap();
         assert_eq!(responses[0].outputs[0].data, json!([5.0]));
         assert_eq!(responses[0].parameters["backend"], json!("python_cpu"));
+    }
+
+    struct PostExecutionFailure;
+
+    impl Engine for PostExecutionFailure {
+        fn execute(
+            &self,
+            _model: &LoadedModel,
+            _requests: &[InferRequest],
+        ) -> std::result::Result<Vec<crate::protocol::InferResponse>, EngineFailure> {
+            Err(EngineFailure {
+                phase: FailurePhase::PostExecution,
+                message: "ambiguous completion".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn post_execution_failure_is_never_retried() {
+        let registry = Arc::new(WorkerRegistry::new(60_000));
+        let engines = Arc::new(EngineDirectory::default());
+        for id in ["a", "b"] {
+            registry
+                .register(WorkerRegistration {
+                    id: id.to_owned(),
+                    capacity: 1,
+                    models: BTreeSet::from([model().key]),
+                })
+                .unwrap();
+        }
+        engines.register("a", Arc::new(PostExecutionFailure));
+        engines.register("b", Arc::new(DeterministicCpuEngine::default()));
+        let metrics = Arc::new(Metrics::default());
+        let dispatcher = Dispatcher::new(registry, engines, Arc::clone(&metrics));
+        let error = dispatcher
+            .dispatch(&model(), &[request()], None)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, crate::ErrorCode::Internal);
+        assert_eq!(metrics.safe_retries_total.load(Ordering::Relaxed), 0);
     }
 }
