@@ -83,10 +83,11 @@ model unload are not implemented.
 The dependency-free CPU adapter is covered by unit, subprocess, and
 Rust-to-Python integration tests.
 
-The ONNX Runtime adapter is a real implementation: it lazily creates
-`onnxruntime.InferenceSession` with `CPUExecutionProvider`, maps Triton tensor
-types to NumPy, executes named outputs, and caches sessions. Install its
-optional dependencies with:
+The ONNX Runtime adapter is tested end to end: a dedicated integration test
+generates a deterministic opset-13 Add model, validates it with ONNX, loads it
+through `onnxruntime.InferenceSession` using `CPUExecutionProvider`, executes
+named inputs/output, and asserts output values, shape, and datatype. Install
+runtime dependencies with:
 
 ```powershell
 python -m pip install -e "./python[onnx]"
@@ -97,8 +98,8 @@ Place `model.onnx` beside the version's `model.json`, set its backend to
 
 The optional Torch adapter loads `model.pt` using `torch.jit.load`,
 `map_location="cpu"`, and `torch.inference_mode()`. It deliberately does not
-place models on CUDA. Neither optional framework is installed or executed by
-the default CI/local evidence.
+place models on CUDA. Torch remains uninstalled and unverified in local and CI
+evidence.
 
 ## Verify
 
@@ -108,12 +109,22 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 $env:PYTHONPATH="$PWD/python"
 python -m unittest discover -s python/tests -v
+python -m pip install "./python[onnx-test]"
+python -m unittest discover -s python/tests_onnx -v
 ```
 
 The deterministic suite covers compatible and incompatible batching,
 deadlines, saturated admission, repository reload, capacity and affinity
 routing, lease expiry, pre/post-execution retry safety, worker-process
 protocol, cache refcounts/eviction/reuse, and a real TCP API lifecycle.
+The dedicated Ubuntu CI job installs ONNX test dependencies and executes the
+generated-model integration separately from dependency-free worker tests.
+
+Local ONNX verification on July 17, 2026 used CPython 3.11.9, NumPy 2.4.6,
+ONNX 1.22.0, and ONNX Runtime 1.27.0. The generated Add-model test passed in
+0.243 seconds and verified named inputs/output, `[2, 2]` shape, `FP32`, values
+`[11.0, 22.0, 33.0, 44.0]`, and `CPUExecutionProvider`. Torch was not
+installed or executed.
 
 ## Reproducible benchmark
 
@@ -157,8 +168,9 @@ This is one development-machine CPU run, not a capacity or GPU claim.
   least-load selection, KV-prefix affinity, heartbeat expiry, and
   phase-classified retries that replay only work proven not to have started.
 - Implemented a refcounted paged KV cache with prefix block sharing and LRU
-  eviction plus a versioned Rust/Python engine protocol, tested CPU adapter,
-  real ONNX Runtime CPU adapter, and optional TorchScript CPU adapter.
+  eviction plus a versioned Rust/Python engine protocol; verified deterministic
+  CPU and generated-model ONNX Runtime execution while keeping TorchScript an
+  explicitly optional, unverified adapter.
 
 ## License
 
