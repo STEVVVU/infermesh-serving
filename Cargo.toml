@@ -2,6 +2,8 @@
 name = "infermesh-serving"
 version = "0.1.0"
 edition = "2021"
+# Unchanged: criterion 0.8 (1.86) is the highest-MSRV crate in the resolved
+# tree, so the existing 1.89 floor already satisfies every dependency.
 rust-version = "1.89"
 description = "Production-shaped AI inference serving control plane"
 license = "MIT"
@@ -18,10 +20,40 @@ path = "src/main.rs"
 name = "infermesh-bench"
 path = "src/bin/benchmark.rs"
 
+[[bench]]
+name = "scheduling"
+harness = false
+
 [dependencies]
-ctrlc = "3.4"
+# Async runtime. The control plane is I/O bound on client sockets and on worker
+# engines, so a request is a task rather than a pinned OS thread.
+tokio = { version = "1.53", features = ["full"] }
+# HTTP surface. axum owns routing and extraction; the Triton V2 paths map onto
+# its router one-for-one, preserving the existing wire contract.
+axum = "0.8"
+# Middleware. Admission (concurrency limit + load shed) and request timeouts
+# are cross-cutting concerns, so they live in the service stack, not handlers.
+tower = { version = "0.5", features = ["limit", "load-shed", "timeout"] }
+tower-http = { version = "0.7", features = ["timeout", "trace"] }
+# Structured, level-aware, span-correlated logging.
+tracing = "0.1"
+# Subscriber for the server binary: env-filter plus JSON output, replacing the
+# hand-rolled `structured_log` JSON writer.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Prometheus/OpenMetrics exposition with typed metric families.
+prometheus-client = "0.25"
+# Library error type: derives Display/Error instead of hand-written impls.
+thiserror = "2"
+# Binary-boundary error type, so `main` can report any failure with context.
+anyhow = "1"
+# Server CLI and configuration flags.
+clap = { version = "4.6", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[dev-dependencies]
+# Statistical benchmarking of the scheduling and batching hot paths.
+criterion = { version = "0.8", features = ["async_tokio"] }
 
 [profile.release]
 lto = "thin"
