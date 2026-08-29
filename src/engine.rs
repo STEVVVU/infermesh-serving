@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::metrics::Metrics;
 use crate::protocol::{InferRequest, InferResponse, InferTensor};
@@ -408,12 +409,14 @@ impl Dispatcher {
         for _ in 0..2 {
             let selection = self.registry.reserve(&model.key, prefix_key, &excluded)?;
             let Some(engine) = self.engines.get(&selection.id) else {
+                warn!(
+                    worker = %selection.id,
+                    "reserved worker has no engine mapping; retrying elsewhere"
+                );
                 self.registry.release(&selection.id);
                 excluded.insert(selection.id);
                 retried = true;
-                self.metrics
-                    .safe_retries_total
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.safe_retries_total.inc();
                 continue;
             };
             match engine.execute(model, requests) {
@@ -431,17 +434,25 @@ impl Dispatcher {
                 }
                 Err(failure) => {
                     self.registry.release(&selection.id);
-                    self.metrics
-                        .worker_failures_total
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics.worker_failures_total.inc();
                     if failure.phase == FailurePhase::PreExecution {
+                        warn!(
+                            worker = %selection.id,
+                            message = %failure.message,
+                            "worker failed before execution began; retrying elsewhere"
+                        );
                         excluded.insert(selection.id);
                         retried = true;
-                        self.metrics
-                            .safe_retries_total
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics.safe_retries_total.inc();
                         continue;
                     }
+                    // Post-execution and ambiguous failures are never replayed:
+                    // the request may already have had visible effects.
+                    warn!(
+                        worker = %selection.id,
+                        message = %failure.message,
+                        "worker failed after execution began; not retrying"
+                    );
                     return Err(Error::new(
                         ErrorCode::Internal,
                         format!(
@@ -465,7 +476,6 @@ impl Dispatcher {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     use serde_json::json;
@@ -600,6 +610,6 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.code, crate::ErrorCode::Internal);
-        assert_eq!(metrics.safe_retries_total.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.safe_retries_total.get(), 0);
     }
 }
