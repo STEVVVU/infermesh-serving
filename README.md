@@ -1,9 +1,6 @@
-# InferMesh Serving
+# ML Inference Server
 
-InferMesh is a production-shaped AI inference serving platform with a Rust
-HTTP/control plane and Python model-worker adapters. It implements a useful
-subset of the Triton V2 HTTP API, per-model dynamic batching, bounded
-admission, lease-based worker routing, and a paged prefix KV cache.
+A Rust model-serving backend that batches inference requests, routes work across workers, reloads model versions, and exposes metrics and tracing.
 
 The checked-in workload is deterministic CPU inference. **No GPU execution or
 GPU performance is claimed.**
