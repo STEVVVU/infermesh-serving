@@ -1,43 +1,63 @@
 use std::collections::BTreeSet;
-use std::env;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
-use std::thread;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
+use clap::Parser;
 use infermesh::engine::{DeterministicCpuEngine, Dispatcher, EngineDirectory};
 use infermesh::metrics::Metrics;
 use infermesh::registry::{WorkerRegistration, WorkerRegistry};
 use infermesh::repository::ModelRepository;
 use infermesh::scheduler::Scheduler;
 use infermesh::server::{serve_listener, App};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Barrier, Mutex, Notify};
 
-fn main() {
-    if let Err(error) = run() {
-        eprintln!("{error}");
-        std::process::exit(1);
-    }
+#[derive(Debug, Parser)]
+#[command(
+    name = "infermesh-bench",
+    version,
+    about = "End-to-end Triton V2 HTTP load benchmark"
+)]
+struct Cli {
+    /// Total inference requests to send.
+    #[arg(default_value_t = 2_000)]
+    operations: usize,
+
+    /// Concurrent client tasks.
+    #[arg(default_value_t = 16)]
+    concurrency: usize,
+
+    /// Deterministic CPU workers to register.
+    #[arg(long, default_value_t = 4)]
+    workers: usize,
+
+    /// Concurrent execution slots per worker.
+    #[arg(long, default_value_t = 4)]
+    worker_capacity: usize,
 }
 
-#[allow(clippy::too_many_lines)]
-fn run() -> infermesh::Result<()> {
-    let mut arguments = env::args().skip(1);
-    let operations = parse_or(arguments.next(), 2_000, "operations")?;
-    let concurrency = parse_or(arguments.next(), 16, "concurrency")?;
-    if operations == 0 || concurrency == 0 {
-        return Err(infermesh::Error::new(
-            infermesh::ErrorCode::InvalidArgument,
-            "operations and concurrency must be positive",
-        ));
-    }
-    let operations_u32 = u32::try_from(operations).map_err(|_| {
-        infermesh::Error::new(
-            infermesh::ErrorCode::InvalidArgument,
-            "operation count exceeds u32 benchmark reporting limit",
-        )
-    })?;
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the Tokio runtime")?
+        .block_on(run(cli))
+}
+
+/// The ephemeral server under test, plus the handles needed to stop it.
+struct Server {
+    address: SocketAddr,
+    shutdown: Arc<Notify>,
+    task: tokio::task::JoinHandle<infermesh::Result<()>>,
+}
+
+/// Builds the repository, workers, scheduler, and server the benchmark drives.
+async fn start_server(cli: &Cli) -> anyhow::Result<Server> {
     let repository = Arc::new(ModelRepository::open("model_repository")?);
     let registry = Arc::new(WorkerRegistry::new(60_000));
     let engines = Arc::new(EngineDirectory::default());
@@ -47,11 +67,11 @@ fn run() -> infermesh::Result<()> {
         .into_iter()
         .map(|model| model.key)
         .collect::<BTreeSet<_>>();
-    for number in 0..4 {
+    for number in 0..cli.workers {
         let worker_id = format!("benchmark-{number}");
         registry.register(WorkerRegistration {
             id: worker_id.clone(),
-            capacity: 4,
+            capacity: cli.worker_capacity,
             models: models.clone(),
         })?;
         engines.register(worker_id, Arc::new(DeterministicCpuEngine::default()));
@@ -66,7 +86,7 @@ fn run() -> infermesh::Result<()> {
         dispatcher,
         Arc::clone(&metrics),
     ));
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(Notify::new());
     let app = Arc::new(App {
         repository,
         registry,
@@ -74,62 +94,85 @@ fn run() -> infermesh::Result<()> {
         metrics,
         shutdown: Arc::clone(&shutdown),
     });
-    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = thread::spawn(move || serve_listener(listener, app));
+    let task = tokio::spawn(serve_listener(listener, app));
+    Ok(Server {
+        address,
+        shutdown,
+        task,
+    })
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        cli.operations > 0 && cli.concurrency > 0,
+        "operations and concurrency must be positive"
+    );
+    anyhow::ensure!(
+        cli.workers > 0 && cli.worker_capacity > 0,
+        "workers and worker capacity must be positive"
+    );
+    let operations_u32 = u32::try_from(cli.operations)
+        .context("operation count exceeds u32 benchmark reporting limit")?;
+
+    let server = start_server(&cli).await?;
+    let address = server.address;
 
     let next = Arc::new(AtomicUsize::new(0));
-    let latencies = Arc::new(Mutex::new(Vec::with_capacity(operations)));
+    let latencies = Arc::new(Mutex::new(Vec::with_capacity(cli.operations)));
     let errors = Arc::new(AtomicUsize::new(0));
-    let barrier = Arc::new(Barrier::new(concurrency + 1));
-    let started = Instant::now();
-    let mut clients = Vec::new();
-    for _ in 0..concurrency {
+    // Clients start together so the measured window excludes task spawn cost.
+    let barrier = Arc::new(Barrier::new(cli.concurrency + 1));
+    let mut clients = Vec::with_capacity(cli.concurrency);
+    for _ in 0..cli.concurrency {
         let next = Arc::clone(&next);
         let latencies = Arc::clone(&latencies);
         let errors = Arc::clone(&errors);
         let barrier = Arc::clone(&barrier);
-        clients.push(thread::spawn(move || {
-            barrier.wait();
+        let operations = cli.operations;
+        clients.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let mut samples = Vec::new();
             loop {
                 let request_number = next.fetch_add(1, Ordering::Relaxed);
                 if request_number >= operations {
-                    return;
+                    break;
                 }
                 let request_started = Instant::now();
-                if infer(address, request_number).is_err() {
+                if infer(address, request_number).await.is_err() {
                     errors.fetch_add(1, Ordering::Relaxed);
                 }
-                let latency_us = request_started
-                    .elapsed()
-                    .as_micros()
-                    .try_into()
-                    .unwrap_or(u64::MAX);
-                latencies
-                    .lock()
-                    .expect("latency lock poisoned")
-                    .push(latency_us);
+                samples.push(
+                    request_started
+                        .elapsed()
+                        .as_micros()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                );
             }
+            // Samples are merged once per client rather than per request, so
+            // the shared lock is not part of the measured path.
+            latencies.lock().await.extend(samples);
         }));
     }
-    barrier.wait();
+    barrier.wait().await;
+    let started = Instant::now();
     for client in clients {
-        client.join().expect("benchmark client did not panic");
+        client.await.context("benchmark client task panicked")?;
     }
     let elapsed = started.elapsed();
-    shutdown.store(true, Ordering::SeqCst);
+    server.shutdown.notify_one();
     server
-        .join()
-        .expect("server did not panic")
-        .expect("server stopped cleanly");
+        .task
+        .await
+        .context("server task panicked")?
+        .context("server stopped with an error")?;
 
-    let mut latencies = Arc::try_unwrap(latencies)
-        .expect("benchmark owns latency samples")
-        .into_inner()
-        .expect("latency lock not poisoned");
+    let mut latencies = latencies.lock().await;
     latencies.sort_unstable();
     let errors = errors.load(Ordering::Relaxed);
-    let successful = operations - errors;
+    let successful = cli.operations - errors;
     let successful_f64 = f64::from(
         operations_u32 - u32::try_from(errors).expect("errors are bounded by operations"),
     );
@@ -137,8 +180,8 @@ fn run() -> infermesh::Result<()> {
         "{}",
         serde_json::json!({
             "benchmark": "triton_v2_http_dynamic_batching",
-            "operations": operations,
-            "concurrency": concurrency,
+            "operations": cli.operations,
+            "concurrency": cli.concurrency,
             "successful": successful,
             "errors": errors,
             "elapsed_seconds": elapsed.as_secs_f64(),
@@ -152,13 +195,14 @@ fn run() -> infermesh::Result<()> {
             "max_batch_size": 16,
             "max_queue_delay_us": 2000,
             "backend": "deterministic_cpu",
+            "runtime": "tokio",
             "gpu_execution": false
         })
     );
     Ok(())
 }
 
-fn infer(address: std::net::SocketAddr, request_number: usize) -> std::io::Result<()> {
+async fn infer(address: SocketAddr, request_number: usize) -> std::io::Result<()> {
     let body = serde_json::json!({
         "id": format!("bench-{request_number}"),
         "inputs": [
@@ -167,16 +211,17 @@ fn infer(address: std::net::SocketAddr, request_number: usize) -> std::io::Resul
         ]
     })
     .to_string();
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
-    write!(
-        stream,
-        "POST /v2/models/adder/infer HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )?;
-    stream.flush()?;
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))??;
+    let request = format!(
+        "POST /v2/models/adder/infer HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
     let mut response = String::new();
-    stream.read_to_string(&mut response)?;
+    stream.read_to_string(&mut response).await?;
     if !response.starts_with("HTTP/1.1 200") {
         return Err(std::io::Error::other("non-200 inference response"));
     }
@@ -184,17 +229,9 @@ fn infer(address: std::net::SocketAddr, request_number: usize) -> std::io::Resul
 }
 
 fn percentile(sorted: &[u64], percentile: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
     let index = (sorted.len() * percentile).div_ceil(100).saturating_sub(1);
     sorted[index.min(sorted.len().saturating_sub(1))]
-}
-
-fn parse_or(value: Option<String>, default: usize, name: &str) -> infermesh::Result<usize> {
-    value.map_or(Ok(default), |value| {
-        value.parse().map_err(|error| {
-            infermesh::Error::new(
-                infermesh::ErrorCode::InvalidArgument,
-                format!("invalid {name}: {error}"),
-            )
-        })
-    })
 }
