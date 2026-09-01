@@ -28,9 +28,16 @@ All dimensions must be positive in requests. Data is a flat JSON array whose
 length must equal the shape product. The first dimension contributes to total
 batch size; remaining dimensions form the compatibility signature.
 
-The implementation limits request bodies to 4 MiB, headers to 64 KiB, tensors
-to 1,000,000 elements, and requests to 64 inputs. It rejects chunked transfer
-encoding and closes each HTTP/1.1 connection after one request.
+The implementation limits request bodies to 4 MiB, tensors to 1,000,000
+elements, and requests to 64 inputs. Header limits and chunked-transfer handling
+are now hyper's rather than hand-written; chunked bodies are accepted by the
+transport and still bounded by the 4 MiB body limit, where the previous
+hand-rolled parser rejected them outright.
+
+Errors are returned as `{"error": "..."}` with the status implied by the
+control-plane error code (400 invalid argument, 404 not found, 408 deadline
+exceeded, 429 resource exhausted, 503 unavailable, 500 internal). An unparseable
+body is a 400, not a framework-default 422.
 
 ## Engine protocol
 

@@ -30,9 +30,14 @@ queue length, worker capacity, and KV blocks are bounded. However, JSON parsing
 still allocates proportional to accepted body size, snapshots of request
 values are cloned into batches, and Python framework memory is not controlled.
 
-The fixed HTTP pool avoids unbounded connection threads, but slow clients can
-occupy a worker for the five-second read timeout. There is no keep-alive,
-streaming body parser, HTTP/2, or fairness scheduler.
+The concurrency limit bounds in-flight request work and sheds beyond it, and a
+server-wide timeout bounds any single request. Connections themselves are no
+longer the scarce resource they were under a fixed thread pool, but that also
+means a client can hold many idle connections open cheaply. There is no
+per-connection limit, per-IP quota, or fairness scheduler.
+
+Bodies are capped by `DefaultBodyLimit` and buffered whole before deserialization,
+so there is no streaming body parser. HTTP/2 is not enabled.
 
 ## GPU boundary
 

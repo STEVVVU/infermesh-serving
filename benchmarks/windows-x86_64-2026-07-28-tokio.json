@@ -1,0 +1,56 @@
+{
+  "artifact_version": 2,
+  "measured_at": "2026-07-28",
+  "command": "cargo run --release --bin infermesh-bench -- 2000 16",
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "os": "windows",
+  "arch": "x86_64",
+  "logical_cpus": 14,
+  "runtime": "tokio",
+  "benchmark": "triton_v2_http_dynamic_batching",
+  "operations": 2000,
+  "concurrency": 16,
+  "runs": 7,
+  "errors_across_all_runs": 0,
+  "representative_run": {
+    "note": "The run whose throughput is closest to the 7-run median.",
+    "successful": 2000,
+    "errors": 0,
+    "elapsed_seconds": 1.6791941,
+    "throughput_requests_per_second": 1191.0475388163882,
+    "latency_us": {
+      "p50": 6834,
+      "p95": 49810,
+      "p99": 70969
+    }
+  },
+  "distribution_across_7_runs": {
+    "note": "Reported because a single loopback run is noisy; the spread is the honest picture.",
+    "throughput_requests_per_second": {
+      "median": 1191.0475,
+      "min": 1025.2492,
+      "max": 1720.2064
+    },
+    "elapsed_seconds": {
+      "median": 1.6792,
+      "min": 1.1627,
+      "max": 1.9507
+    },
+    "latency_us": {
+      "p50": { "median": 6834, "min": 5928, "max": 8711 },
+      "p95": { "median": 33316, "min": 23782, "max": 57932 },
+      "p99": { "median": 103562, "min": 63075, "max": 141834 }
+    }
+  },
+  "model": "adder:1",
+  "max_batch_size": 16,
+  "max_queue_delay_us": 2000,
+  "backend": "deterministic_cpu",
+  "gpu_execution": false,
+  "methodology_changes_since_v1": [
+    "The server and load generator now run on separate Tokio runtimes. Sharing one runtime makes client tasks compete with the server's worker threads, inflating measured tail latency with client scheduling delay.",
+    "Latency samples are merged once per client instead of once per request, so the shared lock is no longer inside the measured path.",
+    "Runs are spaced apart. Back-to-back runs exhaust the Windows ephemeral port range (TIME_WAIT plateaus near 32k with one connection per request), which produces connection errors that are a harness artifact, not a server failure."
+  ],
+  "notes": "Local runs over loopback TCP/HTTP using one connection per request. Release compilation is excluded. No GPU, ONNX Runtime, or PyTorch execution was measured. Not a capacity or service-level claim."
+}

@@ -42,11 +42,24 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    tokio::runtime::Builder::new_multi_thread()
+    // The server and the load generator get separate runtimes on purpose.
+    //
+    // Sharing one runtime makes the client tasks compete with the server's own
+    // worker threads for the same cores, which shows up as server tail latency
+    // even though it is really client scheduling delay. The previous
+    // thread-based harness gave clients their own OS threads and so did not
+    // have this problem; splitting the runtimes preserves that property and
+    // keeps the measurement about the server.
+    let server_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("failed to build the Tokio runtime")?
-        .block_on(run(cli))
+        .context("failed to build the server runtime")?;
+    let server = server_runtime.block_on(start_server(&cli))?;
+    let client_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the client runtime")?;
+    client_runtime.block_on(run(cli, server))
 }
 
 /// The ephemeral server under test, plus the handles needed to stop it.
@@ -104,7 +117,7 @@ async fn start_server(cli: &Cli) -> anyhow::Result<Server> {
     })
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(cli: Cli, server: Server) -> anyhow::Result<()> {
     anyhow::ensure!(
         cli.operations > 0 && cli.concurrency > 0,
         "operations and concurrency must be positive"
@@ -116,7 +129,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let operations_u32 = u32::try_from(cli.operations)
         .context("operation count exceeds u32 benchmark reporting limit")?;
 
-    let server = start_server(&cli).await?;
     let address = server.address;
 
     let next = Arc::new(AtomicUsize::new(0));

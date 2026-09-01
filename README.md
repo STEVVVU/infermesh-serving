@@ -1,12 +1,29 @@
 # InferMesh Serving
 
-InferMesh is a production-shaped AI inference serving platform with a Rust
-HTTP/control plane and Python model-worker adapters. It implements a useful
+InferMesh is a production-shaped AI inference serving platform with an async
+Rust HTTP/control plane and Python model-worker adapters. It implements a useful
 subset of the Triton V2 HTTP API, per-model dynamic batching, bounded
 admission, lease-based worker routing, and a paged prefix KV cache.
 
 The checked-in workload is deterministic CPU inference. **No GPU execution or
 GPU performance is claimed.**
+
+## Stack
+
+| Concern | Crate | Why |
+| --- | --- | --- |
+| Async runtime | `tokio` 1.53 | The control plane is I/O bound on client sockets and worker engines. A request is a task, not a pinned OS thread. |
+| HTTP surface | `axum` 0.8 | Routing and extraction for the Triton V2 paths. Replaces ~220 lines of hand-written HTTP/1.1 parsing. |
+| Middleware | `tower` 0.5, `tower-http` 0.7 | Admission (concurrency limit + load shed), request timeouts, and request tracing belong in the service stack, not handlers. |
+| Logging | `tracing` 0.1, `tracing-subscriber` 0.3 | Structured, level-aware, span-correlated events with `RUST_LOG` filtering and JSON or text output. |
+| Metrics | `prometheus-client` 0.25 | Typed OpenMetrics families instead of hand-formatted exposition text. |
+| Errors | `thiserror` 2, `anyhow` 1 | Derived library errors; contextual errors at binary boundaries. |
+| CLI | `clap` 4.6 | Declarative flags for bind address, repository, engine, worker sizing, and log format. |
+| Benchmarks | `criterion` 0.8 | Statistical measurement of the scheduling hot paths. |
+
+The crate keeps `unsafe_code = "forbid"` and clippy `pedantic`. MSRV is
+unchanged at **1.89** — `criterion` 0.8 needs 1.86 and is the highest-MSRV
+crate in the resolved tree, so nothing forces a raise.
 
 ## Implemented system behavior
 
@@ -22,8 +39,11 @@ GPU performance is claimed.**
   failures are returned without replay
 - Refcounted paged KV-cache blocks, longest-prefix reuse, active-lease pinning,
   LRU eviction, and LLM scheduler integration
-- Prometheus counters/histograms, structured JSON logs, health/readiness,
-  bounded HTTP connections, and graceful drain on Ctrl-C or control endpoint
+- Prometheus counters/histograms, structured `tracing` logs, health/readiness,
+  bounded request concurrency with load shedding, and graceful drain on Ctrl-C
+  or control endpoint
+- Cancellation safety: a client that disconnects or times out has its queued
+  request dropped before it consumes worker capacity
 - Rust deterministic CPU engine, persistent Python engine protocol, real ONNX
   Runtime CPU adapter, and optional CPU TorchScript adapter
 
@@ -36,6 +56,16 @@ CPU runtime:
 cargo build --release
 cargo run --release --bin infermesh-server -- serve model_repository 127.0.0.1:8000
 ```
+
+The server has a full CLI; `--help` lists everything:
+
+```powershell
+cargo run --release --bin infermesh-server -- serve --help
+```
+
+Useful flags are `--engine` (`rust-cpu`, `python-cpu`, `python-onnx`,
+`python-torch`), `--workers` / `--worker-capacity`, `--lease-ms`, and
+`--log-format` (`json` or `text`). Log verbosity honours `RUST_LOG`.
 
 Query health and model metadata:
 
@@ -52,10 +82,12 @@ curl.exe -X POST http://127.0.0.1:8000/v2/models/adder/infer `
   -d '{"id":"demo","inputs":[{"name":"INPUT0","shape":[1,1],"datatype":"FP64","data":[2.0]},{"name":"INPUT1","shape":[1,1],"datatype":"FP64","data":[3.0]}]}'
 ```
 
-Set `INFERMESH_ENGINE=python-cpu` to run each local worker through the
-persistent Rust-to-Python engine protocol:
+Run each local worker through the persistent Rust-to-Python engine protocol
+with either the flag or the environment variable:
 
 ```powershell
+cargo run --release --bin infermesh-server -- serve --engine python-cpu
+# or, as before:
 $env:INFERMESH_ENGINE="python-cpu"
 cargo run --release --bin infermesh-server -- serve
 ```
@@ -77,6 +109,16 @@ cargo run --release --bin infermesh-server -- serve
 JSON tensor payloads support `FP32`, `FP64`, `INT32`, and `INT64`. Binary tensor
 extensions, shared memory, gRPC, sequence batching, decoupled responses, and
 model unload are not implemented.
+
+Wire compatibility was preserved deliberately through the axum migration: every
+route keeps its path, method, status codes, and JSON body shape, including the
+`{"error": "..."}` error envelope and a 400 (not a framework 422) for
+unparseable bodies. This is covered by wire-level integration tests that speak
+raw HTTP/1.1 over a TCP socket rather than calling the router in-process.
+
+One intentional exposition difference: `prometheus-client` follows OpenMetrics,
+so a counter's `# TYPE` line names the metric family without the `_total`
+suffix while the sample line keeps it. Series names themselves are unchanged.
 
 ## Python adapters
 
@@ -129,24 +171,55 @@ installed or executed.
 ## Reproducible benchmark
 
 ```powershell
-cargo run --release --bin infermesh-bench -- 2000 16
+cargo run --release --bin infermesh-bench -- 2000 16   # end-to-end HTTP
+cargo bench                                            # scheduling hot paths
 ```
 
-This starts an ephemeral local server and sends 2,000 Triton V2 HTTP requests
-from 16 client threads, using one TCP connection per request. On July 17, 2026,
-Windows x86-64 with Rust 1.96.0 produced:
+The HTTP benchmark starts an ephemeral local server and sends 2,000 Triton V2
+requests from 16 client tasks, one TCP connection per request, with the load
+generator on a runtime separate from the server's.
 
-| Measurement | Result |
-| --- | ---: |
-| Successful / errors | 2,000 / 0 |
-| Throughput | 1,296.01 requests/s |
-| p50 latency | 11.081 ms |
-| p95 latency | 20.213 ms |
-| p99 latency | 39.151 ms |
+Measured on July 28, 2026, Windows x86-64, 14 logical CPUs, Rust 1.96.0, over
+**seven runs with zero errors**. A single loopback run is noisy, so the spread
+is reported rather than one figure:
 
-The exact artifact is
-[`benchmarks/windows-x86_64-2026-07-17.json`](benchmarks/windows-x86_64-2026-07-17.json).
-This is one development-machine CPU run, not a capacity or GPU claim.
+| Measurement | Median | Min | Max |
+| --- | ---: | ---: | ---: |
+| Throughput | 1,191.05 req/s | 1,025.25 | 1,720.21 |
+| p50 latency | 6.834 ms | 5.928 ms | 8.711 ms |
+| p95 latency | 33.316 ms | 23.782 ms | 57.932 ms |
+| p99 latency | 103.562 ms | 63.075 ms | 141.834 ms |
+
+The artifact is
+[`benchmarks/windows-x86_64-2026-07-28-tokio.json`](benchmarks/windows-x86_64-2026-07-28-tokio.json).
+These are development-machine CPU runs, not a capacity or GPU claim.
+
+### What the async migration did to the numbers
+
+The pre-async revision recorded a single run at 1,296.01 req/s, p50 11.081 ms,
+p95 20.213 ms, p99 39.151 ms
+([artifact](benchmarks/windows-x86_64-2026-07-17.json)). Honestly compared:
+
+- **p50 improved substantially**, 11.081 ms to 6.834 ms. Requests no longer
+  queue for one of 16 fixed connection threads.
+- **Median throughput is slightly lower**, 1,296 to 1,191 req/s — but the old
+  number is a single sample and the new range (1,025–1,720) contains it. It
+  would overstate the data to call this a measured regression.
+- **Tail latency got worse**, p99 39 ms to 104 ms. This is a real regression.
+  The benchmark workload is trivial CPU arithmetic, so async overhead is a
+  larger share of total time than it would be with real model compute, and the
+  concurrency-limit-plus-shed stack admits more work concurrently than 16
+  threads did, spreading latency instead of queueing at accept.
+
+**Async is not claimed as a throughput win here, because on a workload this
+cheap it is not one.** What it buys is cancellation safety, per-request
+timeouts, and a concurrency model that does not pin an OS thread per waiting
+request — properties that matter when engines are actually slow, which is the
+real serving case.
+
+See [benchmark methodology](docs/benchmark.md) for the harness details,
+including the Windows ephemeral-port exhaustion that makes back-to-back runs
+report false connection errors.
 
 ## Design and limits
 
