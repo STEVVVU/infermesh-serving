@@ -508,6 +508,15 @@ mod tests {
         }
     }
 
+    /// Deadline for submits that are expected to succeed.
+    ///
+    /// These tests assert *scheduling* behaviour, not timeliness, so their
+    /// deadlines must never be the thing under test. A short deadline makes the
+    /// success path fail whenever the machine is loaded enough that execution
+    /// overruns it — real fragility, since CI runners are shared. Tests that
+    /// deliberately assert expiry keep their own tight deadlines below.
+    const UNREACHABLE_DEADLINE: Duration = Duration::from_secs(60);
+
     fn model(queue_delay_us: u64, queue_capacity: usize) -> LoadedModel {
         LoadedModel {
             key: ModelKey {
@@ -597,7 +606,7 @@ mod tests {
             let metrics = Arc::clone(&metrics);
             tasks.push(tokio::spawn(async move {
                 batcher
-                    .submit(request(id), Duration::from_secs(1), &metrics)
+                    .submit(request(id), UNREACHABLE_DEADLINE, &metrics)
                     .await
                     .unwrap()
             }));
@@ -633,7 +642,7 @@ mod tests {
         let first_metrics = Arc::clone(&metrics);
         let first = tokio::spawn(async move {
             first_batcher
-                .submit(request("first"), Duration::from_secs(1), &first_metrics)
+                .submit(request("first"), UNREACHABLE_DEADLINE, &first_metrics)
                 .await
         });
         // The engine has entered execution, so the batcher is no longer reading
@@ -645,20 +654,22 @@ mod tests {
             .try_send(super::QueuedRequest {
                 request: request("second"),
                 enqueued: Instant::now(),
-                deadline: Instant::now() + Duration::from_secs(1),
+                deadline: Instant::now() + UNREACHABLE_DEADLINE,
                 response: second_sender,
             })
             .unwrap();
         let error = batcher
-            .submit(request("rejected"), Duration::from_secs(1), &metrics)
+            .submit(request("rejected"), UNREACHABLE_DEADLINE, &metrics)
             .await
             .unwrap_err();
         assert_eq!(error.code, crate::ErrorCode::ResourceExhausted);
         release_sender.send(()).unwrap();
         started_receiver.recv().unwrap();
         release_sender.send(()).unwrap();
-        assert!(first.await.unwrap().is_ok());
-        assert!(second_receiver.await.unwrap().is_ok());
+        let first_outcome = first.await.unwrap();
+        assert!(first_outcome.is_ok(), "first: {:?}", first_outcome.err());
+        let second_outcome = second_receiver.await.unwrap();
+        assert!(second_outcome.is_ok(), "second: {:?}", second_outcome.err());
         assert_eq!(metrics.admission_rejected_total.get(), 1);
     }
 
@@ -687,11 +698,11 @@ mod tests {
             outputs: Vec::new(),
         };
         batcher
-            .submit(llm_request(), Duration::from_secs(1), &metrics)
+            .submit(llm_request(), UNREACHABLE_DEADLINE, &metrics)
             .await
             .unwrap();
         batcher
-            .submit(llm_request(), Duration::from_secs(1), &metrics)
+            .submit(llm_request(), UNREACHABLE_DEADLINE, &metrics)
             .await
             .unwrap();
         assert_eq!(metrics.cache_misses_total.get(), 1);
@@ -712,7 +723,7 @@ mod tests {
             let metrics = Arc::clone(&metrics);
             tasks.push(tokio::spawn(async move {
                 batcher
-                    .submit(request, Duration::from_secs(1), &metrics)
+                    .submit(request, UNREACHABLE_DEADLINE, &metrics)
                     .await
                     .unwrap()
             }));
@@ -735,11 +746,7 @@ mod tests {
         let submit_metrics = Arc::clone(&metrics);
         let submitted = tokio::spawn(async move {
             submit_batcher
-                .submit(
-                    request("cancelled"),
-                    Duration::from_secs(30),
-                    &submit_metrics,
-                )
+                .submit(request("cancelled"), UNREACHABLE_DEADLINE, &submit_metrics)
                 .await
         });
         // Let the request reach the queue, then cancel the caller.
@@ -750,7 +757,7 @@ mod tests {
         // A later request proceeds normally, and the cancelled one never
         // reached an engine.
         batcher
-            .submit(request("live"), Duration::from_secs(5), &metrics)
+            .submit(request("live"), UNREACHABLE_DEADLINE, &metrics)
             .await
             .unwrap();
         assert_eq!(metrics.client_cancelled_total.get(), 1);
@@ -769,7 +776,7 @@ mod tests {
         assert_eq!(error.code, crate::ErrorCode::DeadlineExceeded);
 
         let response = batcher
-            .submit(request("recovered"), Duration::from_secs(5), &metrics)
+            .submit(request("recovered"), UNREACHABLE_DEADLINE, &metrics)
             .await
             .unwrap();
         assert_eq!(response.outputs[0].data, json!([5.0]));
