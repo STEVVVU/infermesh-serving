@@ -23,8 +23,18 @@ jobs:
         with:
           python-version: "3.11"
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets
+      # Criterion benches are compiled by --all-targets but never executed by
+      # it. Running them under --test exercises each benchmark body once, so a
+      # bench that panics cannot rot unnoticed. Timings are deliberately not
+      # collected: shared runners cannot produce meaningful ones.
+      - run: cargo test --benches
+      # `unittest discover` exits 0 when it discovers zero tests, so assert the
+      # expected count instead of trusting the exit code.
+      - run: python scripts/check_test_discovery.py python/tests 2
+        env:
+          PYTHONPATH: python
       - run: python -m unittest discover -s python/tests -v
         env:
           PYTHONPATH: python
@@ -54,6 +64,10 @@ jobs:
           cache-dependency-path: python/pyproject.toml
       - run: python -m pip install --upgrade pip
       - run: python -m pip install "./python[onnx-test]"
+      # Guards against the extras silently failing to install: without
+      # onnx/onnxruntime the module is unimportable, which discovery would
+      # otherwise report as a passing zero-test run.
+      - run: python scripts/check_test_discovery.py python/tests_onnx 1
       - run: python -m unittest discover -s python/tests_onnx -v
 
   benchmark-smoke:
