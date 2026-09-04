@@ -24,8 +24,25 @@ use tokio::task::JoinHandle;
 struct Harness {
     address: SocketAddr,
     shutdown: Arc<Notify>,
+    metrics: Arc<Metrics>,
     server: JoinHandle<infermesh::Result<()>>,
 }
+
+/// Per-request `timeout_us` for inferences whose *success* is asserted.
+///
+/// The checked-in `adder` config carries a 500 ms `default_timeout_us` — a
+/// sensible production value, but it means every success assertion below would
+/// otherwise ride on the request finishing inside 500 ms. That is real
+/// fragility: on a loaded machine (shared CI runner, debug build, tests running
+/// in parallel) queueing plus execution overruns it and the server correctly
+/// answers 408, failing a test that was never about timeliness. These tests opt
+/// out through the wire's own `timeout_us` parameter, which also keeps the
+/// override visible in the request rather than hidden in the model config.
+///
+/// The deadline path itself is asserted deliberately, with a 1 ms deadline
+/// against a 50 ms engine, in
+/// `request_timeout_parameter_returns_request_timeout_status`.
+const UNREACHABLE_TIMEOUT_US: u64 = 60_000_000;
 
 async fn start() -> Harness {
     let repository = Arc::new(ModelRepository::open("model_repository").unwrap());
@@ -63,7 +80,7 @@ async fn start() -> Harness {
         repository,
         registry,
         scheduler,
-        metrics,
+        metrics: Arc::clone(&metrics),
         shutdown: Arc::clone(&shutdown),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -72,6 +89,7 @@ async fn start() -> Harness {
     Harness {
         address,
         shutdown,
+        metrics,
         server,
     }
 }
@@ -105,6 +123,7 @@ async fn triton_v2_endpoints_infer_observe_reload_and_shutdown() {
         "/v2/models/adder/versions/1/infer",
         Some(json!({
             "id": "integration",
+            "parameters": {"timeout_us": UNREACHABLE_TIMEOUT_US},
             "inputs": [
                 {"name": "INPUT0", "shape": [1, 1], "datatype": "FP64", "data": [2.0]},
                 {"name": "INPUT1", "shape": [1, 1], "datatype": "FP64", "data": [4.0]}
@@ -155,6 +174,7 @@ async fn triton_v2_contract_details_are_preserved() {
         "/v2/models/adder/infer",
         Some(json!({
             "id": "latest",
+            "parameters": {"timeout_us": UNREACHABLE_TIMEOUT_US},
             "inputs": [
                 {"name": "INPUT0", "shape": [1, 1], "datatype": "FP64", "data": [1.0]},
                 {"name": "INPUT1", "shape": [1, 1], "datatype": "FP64", "data": [1.0]}
@@ -305,6 +325,7 @@ async fn concurrent_requests_are_all_answered_correctly() {
                 "/v2/models/adder/infer",
                 Some(json!({
                     "id": format!("concurrent-{number}"),
+                    "parameters": {"timeout_us": UNREACHABLE_TIMEOUT_US},
                     "inputs": [
                         {"name": "INPUT0", "shape": [1, 1], "datatype": "FP64", "data": [number]},
                         {"name": "INPUT1", "shape": [1, 1], "datatype": "FP64", "data": [1.0]}
@@ -341,6 +362,7 @@ async fn graceful_shutdown_drains_an_in_flight_request() {
 
     let body = json!({
         "id": "draining",
+        "parameters": {"timeout_us": UNREACHABLE_TIMEOUT_US},
         "inputs": [
             {"name": "INPUT0", "shape": [1, 1], "datatype": "FP64", "data": [3.0]},
             {"name": "INPUT1", "shape": [1, 1], "datatype": "FP64", "data": [4.0]}
@@ -355,6 +377,17 @@ async fn graceful_shutdown_drains_an_in_flight_request() {
     stream.write_all(request.as_bytes()).await.unwrap();
     stream.flush().await.unwrap();
 
+    // A completed client-side connect only means the kernel finished the
+    // handshake into the accept backlog — it does not mean axum has accepted
+    // the connection yet. Signalling the drain before that accept happens is a
+    // legitimate race that resets the socket, so wait for the server to have
+    // actually taken ownership of the request. `requests_total` is incremented
+    // once the handler reaches the scheduler, which is strictly after accept.
+    await_metric(&harness.metrics, |metrics| {
+        metrics.requests_total.get() == 1
+    })
+    .await;
+
     // The request is now owned by the server; ask it to drain.
     harness.shutdown.notify_one();
 
@@ -366,6 +399,19 @@ async fn graceful_shutdown_drains_an_in_flight_request() {
     assert_eq!(parsed["outputs"][0]["data"], json!([7.0]));
 
     harness.server.await.unwrap().unwrap();
+}
+
+/// Polls until `predicate` holds, so tests synchronize on observed server state
+/// rather than on a sleep long enough to "probably" be sufficient.
+async fn await_metric(metrics: &Metrics, predicate: impl Fn(&Metrics) -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !predicate(metrics) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server state never reached the expected value within 10s"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 async fn request(
