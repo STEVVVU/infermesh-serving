@@ -1,5 +1,7 @@
 {
   "artifact_version": 2,
+  "superseded_by": "windows-x86_64-2026-07-28-tokio-remeasured.json",
+  "superseded_note": "Retained for provenance. An independent 12-run re-measurement reproduced throughput and p95 but not p50 (median 8859 us vs 6834) or p99 (median 74590 us vs 103562); the ranges below were too narrow because socket pressure was not controlled for. See the newer artifact. Both artifacts were taken on the same date; the superseding one is distinguished by the `-remeasured` suffix rather than by date.",
   "measured_at": "2026-07-28",
   "command": "cargo run --release --bin infermesh-bench -- 2000 16",
   "rustc": "1.96.0 (ac68faa20 2026-05-25)",

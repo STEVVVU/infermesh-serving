@@ -1,0 +1,67 @@
+{
+  "artifact_version": 4,
+  "measured_at": "2026-07-28",
+  "supersedes": "windows-x86_64-2026-07-28-tokio-remeasured.json",
+  "supersedes_note": "Third sample of the same workload on the same machine and date. It supersedes the v3 re-measurement because v3 was taken while several unrelated heavy compile jobs were running on this box, which depressed every figure. v3 is retained for provenance: the discrepancy between v2, v3, and v4 is itself the finding, and is the reason background CPU load is now recorded per run.",
+  "command": "cargo run --release --bin infermesh-bench -- 2000 16",
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "os": "windows",
+  "arch": "x86_64",
+  "logical_cpus": 14,
+  "runtime": "tokio",
+  "benchmark": "triton_v2_http_dynamic_batching",
+  "operations": 2000,
+  "concurrency": 16,
+  "runs": 12,
+  "errors_across_all_runs": 0,
+  "run_admission_criteria": [
+    "Fewer than ~5,000 TIME_WAIT entries at run start (see socket_pressure_finding).",
+    "Zero errors.",
+    "60s of spacing between runs.",
+    "Whole-machine CPU utilisation sampled immediately before each run and recorded, because it turned out to dominate the result."
+  ],
+  "distribution_across_12_runs": {
+    "throughput_requests_per_second": {
+      "median": 2138.72,
+      "min": 1840.27,
+      "max": 2803.3
+    },
+    "latency_us": {
+      "p50": { "median": 6282, "min": 4378, "max": 7132 },
+      "p95": { "median": 15311, "min": 13007, "max": 18210 },
+      "p99": { "median": 23772, "min": 20061, "max": 43721 }
+    }
+  },
+  "background_load_finding": {
+    "note": "The dominant source of variance on this machine is not the server, the socket state, or CPU power management. It is unrelated CPU load. This was found by re-running the byte-identical binary after unrelated compile jobs finished and getting figures roughly 75% higher than v3.",
+    "observed": "Across the runs in this artifact, whole-machine CPU utilisation sampled at run start ranged from ~19% to ~62%, and throughput tracked it closely: the three runs starting under 25% CPU returned 2,440-2,803 req/s, while the two starting above 60% returned 1,840-1,941 req/s.",
+    "implication": "A benchmark taken on a shared or busy developer machine can be wrong by a factor of ~1.5 while reporting zero errors and a plausible-looking number. Record the machine's load alongside the result, or the artifact cannot be interpreted later. This is why v3's medians are superseded rather than merely re-averaged with these."
+  },
+  "socket_pressure_finding": {
+    "note": "Carried forward from v3 and still valid. Throughput degrades monotonically as TIME_WAIT accumulates, well BEFORE any connection errors appear, so a port-starved run silently reports a low number rather than failing.",
+    "observed": "With TIME_WAIT above ~10,000, throughput fell to 244-400 req/s and p99 rose past 350 ms, with 0-17 errors.",
+    "implication": "A run with zero errors is not automatically a valid run. Filter on starting socket pressure, not just on the absence of errors."
+  },
+  "comparison_with_pre_async": {
+    "note": "Read with care. The pre-async baseline (windows-x86_64-2026-07-17.json) is a SINGLE run whose machine load was not recorded. Given that load moves this benchmark by ~1.5x, that baseline cannot support a precise A/B claim in either direction.",
+    "pre_async_single_run": {
+      "throughput_requests_per_second": 1296.01,
+      "latency_us": { "p50": 11081, "p95": 20213, "p99": 39151 }
+    },
+    "throughput": "The async median (2,139 req/s) is above the pre-async single sample (1,296) and the pre-async figure sits below this artifact's minimum (1,840). Directionally favourable, but not a clean A/B: the baseline's machine conditions are unknown.",
+    "p50": "Improved (11.081 ms to a median of 6.282 ms); the baseline sits outside this artifact's range.",
+    "p95": "Improved (20.213 ms to a median of 15.311 ms); ranges do not overlap.",
+    "p99": "Improved (39.151 ms to a median of 23.772 ms), though this artifact's max (43.721 ms) exceeds the baseline, so the tail is not uniformly better run to run.",
+    "honest_summary": "No throughput or latency win is claimed as a measured result, because the baseline is one unlabelled run. What the async migration is claimed to buy is cancellation safety, per-request deadlines, and not pinning an OS thread per waiting request."
+  },
+  "model": "adder:1",
+  "max_batch_size": 16,
+  "max_queue_delay_us": 2000,
+  "backend": "deterministic_cpu",
+  "gpu_execution": false,
+  "measurement_caveats": [
+    "Power-managed laptop with unpinned CPU clocks and unrelated background load; figures are envelopes, not point claims.",
+    "Loopback TCP/HTTP with one connection per request. Release compilation excluded.",
+    "No GPU, ONNX Runtime, or PyTorch execution was measured. Not a capacity or service-level claim."
+  ]
+}

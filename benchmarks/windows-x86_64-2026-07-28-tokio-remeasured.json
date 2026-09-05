@@ -1,0 +1,54 @@
+{
+  "artifact_version": 3,
+  "superseded_by": "windows-x86_64-2026-07-28-tokio-quiesced.json",
+  "superseded_note": "Retained for provenance, but the medians below are load-contaminated: these runs were taken while several unrelated heavy compile jobs were running on this machine. Re-running the byte-identical binary on an idle machine raised throughput by roughly 75% (median 1203.78 -> 2138.72 req/s). The socket_pressure_finding below is still valid and carried forward. See the v4 artifact.",
+  "measured_at": "2026-07-28",
+  "supersedes": "windows-x86_64-2026-07-28-tokio.json",
+  "supersedes_note": "Same measurement date as the artifact it supersedes, so the filenames are distinguished by the `-remeasured` suffix rather than by date. This is an independent re-run of the byte-identical workload, not a later-day repeat.",
+  "command": "cargo run --release --bin infermesh-bench -- 2000 16",
+  "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+  "os": "windows",
+  "arch": "x86_64",
+  "logical_cpus": 14,
+  "runtime": "tokio",
+  "benchmark": "triton_v2_http_dynamic_batching",
+  "operations": 2000,
+  "concurrency": 16,
+  "runs": 12,
+  "errors_across_all_runs": 0,
+  "distribution_across_12_runs": {
+    "note": "Independent re-measurement. Only runs taken under low socket pressure (fewer than ~5,000 TIME_WAIT entries at start) and with zero errors are included; see socket_pressure_finding.",
+    "throughput_requests_per_second": {
+      "median": 1203.78,
+      "min": 942.9,
+      "max": 1661.13
+    },
+    "latency_us": {
+      "p50": { "median": 8859, "min": 6311, "max": 10946 },
+      "p95": { "median": 34798, "min": 21065, "max": 57067 },
+      "p99": { "median": 74590, "min": 33165, "max": 155351 }
+    }
+  },
+  "comparison_with_v2": {
+    "note": "The v2 artifact's throughput and p95 reproduce; p50 and p99 do not, and v2's envelopes were too narrow.",
+    "throughput_requests_per_second": "reproduces (v2 median 1191.05 vs 1203.78; each median sits inside the other's range)",
+    "p50_us": "does NOT reproduce (v2 median 6834, range 5928-8711; re-measured median 8859, range 6311-10946). v2's max is below this median, so v2's p50 range was too narrow.",
+    "p95_us": "reproduces (v2 median 33316 vs 34798, overlapping ranges)",
+    "p99_us": "does NOT reproduce (v2 median 103562, range 63075-141834; re-measured median 74590, range 33165-155351). v2's stated minimum is above this sample's median, so v2 overstated the tail."
+  },
+  "socket_pressure_finding": {
+    "note": "New finding from this re-measurement, extending the v2 ephemeral-port note. Throughput degrades monotonically as TIME_WAIT accumulates, well BEFORE any connection errors appear, so a port-starved run silently reports a low number rather than failing.",
+    "observed": "With TIME_WAIT above ~10,000, throughput fell to 244-400 req/s and p99 rose past 350 ms, with 0-17 errors. Runs starting below ~5,000 TIME_WAIT stayed in the 940-1,660 req/s band.",
+    "implication": "20s spacing between runs is insufficient on this machine; TIME_WAIT continued rising across a 180s pause. Entries then age out in bulk. Runs must be filtered on starting socket pressure, not just on the absence of errors."
+  },
+  "model": "adder:1",
+  "max_batch_size": 16,
+  "max_queue_delay_us": 2000,
+  "backend": "deterministic_cpu",
+  "gpu_execution": false,
+  "measurement_caveats": [
+    "Power-managed laptop with unpinned CPU clocks; figures are envelopes, not point claims. A quiesced machine would tighten them.",
+    "Loopback TCP/HTTP with one connection per request. Release compilation excluded.",
+    "No GPU, ONNX Runtime, or PyTorch execution was measured. Not a capacity or service-level claim."
+  ]
+}

@@ -138,6 +138,19 @@ python -m pip install -e "./python[onnx]"
 Place `model.onnx` beside the version's `model.json`, set its backend to
 `onnxruntime`, and launch with `INFERMESH_ENGINE=python-onnx`.
 
+**`onnxruntime` stays an optional extra rather than a default dependency.** It
+is the signature runtime for CPU inference serving, so the temptation is to
+promote it — but the deciding factor is that nothing in the default path imports
+it. `OnnxRuntimeAdapter` imports `onnxruntime` lazily inside `_session()`, only
+once a model actually selects that backend, and raises a clear `AdapterError`
+naming the extra if it is absent. Promoting it would add a ~200 MB native
+dependency (plus `numpy`) to every install, including the `deterministic_cpu`
+default and the Rust-only control-plane path, to satisfy an import that may
+never happen. Keeping it optional also keeps `dependencies = []` honest for the
+dependency-free CPU adapter. It is not unverified: the `onnx-runtime` CI job
+installs `[onnx-test]` and runs a real `InferenceSession` end to end, so the
+integration is proven on every push without being imposed on every user.
+
 The optional Torch adapter loads `model.pt` using `torch.jit.load`,
 `map_location="cpu"`, and `torch.inference_mode()`. It deliberately does not
 place models on CUDA. Torch remains uninstalled and unverified in local and CI
@@ -180,19 +193,48 @@ requests from 16 client tasks, one TCP connection per request, with the load
 generator on a runtime separate from the server's.
 
 Measured on July 28, 2026, Windows x86-64, 14 logical CPUs, Rust 1.96.0, over
-**seven runs with zero errors**. A single loopback run is noisy, so the spread
+**twelve runs with zero errors**. A single loopback run is noisy, so the spread
 is reported rather than one figure:
 
 | Measurement | Median | Min | Max |
 | --- | ---: | ---: | ---: |
-| Throughput | 1,191.05 req/s | 1,025.25 | 1,720.21 |
-| p50 latency | 6.834 ms | 5.928 ms | 8.711 ms |
-| p95 latency | 33.316 ms | 23.782 ms | 57.932 ms |
-| p99 latency | 103.562 ms | 63.075 ms | 141.834 ms |
+| Throughput | 2,138.72 req/s | 1,840.27 | 2,803.30 |
+| p50 latency | 6.282 ms | 4.378 ms | 7.132 ms |
+| p95 latency | 15.311 ms | 13.007 ms | 18.210 ms |
+| p99 latency | 23.772 ms | 20.061 ms | 43.721 ms |
 
 The artifact is
-[`benchmarks/windows-x86_64-2026-07-28-tokio.json`](benchmarks/windows-x86_64-2026-07-28-tokio.json).
-These are development-machine CPU runs, not a capacity or GPU claim.
+[`benchmarks/windows-x86_64-2026-07-28-tokio-quiesced.json`](benchmarks/windows-x86_64-2026-07-28-tokio-quiesced.json).
+These are development-machine CPU runs, not a capacity or GPU claim. The
+measurement box is a power-managed laptop with unpinned clocks, so these are
+envelopes rather than point values.
+
+### Why there are three tokio artifacts for one day
+
+This workload was measured three times on the same machine and got three
+different answers, which is worth more than any of the individual numbers:
+
+| Artifact | Throughput median | Conditions |
+| --- | ---: | --- |
+| [`-tokio`](benchmarks/windows-x86_64-2026-07-28-tokio.json) (7 runs) | 1,191 req/s | socket pressure uncontrolled |
+| [`-remeasured`](benchmarks/windows-x86_64-2026-07-28-tokio-remeasured.json) (12 runs) | 1,204 req/s | socket pressure controlled, heavy background compiles running |
+| [`-quiesced`](benchmarks/windows-x86_64-2026-07-28-tokio-quiesced.json) (12 runs) | 2,139 req/s | socket pressure controlled, machine otherwise idle |
+
+Two distinct traps, both of which report **zero errors** while returning a bad
+number:
+
+- Windows `TIME_WAIT` accumulation. With one connection per request, throughput
+  degrades *before* any connection is refused, so run spacing alone moves the
+  result. Runs are now filtered on starting socket pressure.
+- Unrelated CPU load. Re-running the byte-identical binary once background
+  compiles finished raised throughput ~75%. Across the final twelve runs,
+  throughput tracked machine utilisation closely: runs starting below 25% CPU
+  returned 2,440–2,803 req/s, runs starting above 60% returned 1,840–1,941.
+
+The earlier artifacts are kept rather than deleted, because the disagreement
+between them is the honest result. The practical lesson is that a benchmark on
+a busy developer machine can be off by ~1.5x while looking entirely plausible,
+so the machine's load has to be recorded next to the number.
 
 ### What the async migration did to the numbers
 
@@ -200,26 +242,33 @@ The pre-async revision recorded a single run at 1,296.01 req/s, p50 11.081 ms,
 p95 20.213 ms, p99 39.151 ms
 ([artifact](benchmarks/windows-x86_64-2026-07-17.json)). Honestly compared:
 
-- **p50 improved substantially**, 11.081 ms to 6.834 ms. Requests no longer
-  queue for one of 16 fixed connection threads.
-- **Median throughput is slightly lower**, 1,296 to 1,191 req/s — but the old
-  number is a single sample and the new range (1,025–1,720) contains it. It
-  would overstate the data to call this a measured regression.
-- **Tail latency got worse**, p99 39 ms to 104 ms. This is a real regression.
-  The benchmark workload is trivial CPU arithmetic, so async overhead is a
-  larger share of total time than it would be with real model compute, and the
-  concurrency-limit-plus-shed stack admits more work concurrently than 16
-  threads did, spreading latency instead of queueing at accept.
+The single most important caveat is that **the baseline is one run whose machine
+load was not recorded.** Since load alone moves this benchmark by ~1.5x, the
+baseline cannot support a precise A/B claim in either direction. With that said,
+every measurement moved favourably:
 
-**Async is not claimed as a throughput win here, because on a workload this
-cheap it is not one.** What it buys is cancellation safety, per-request
-timeouts, and a concurrency model that does not pin an OS thread per waiting
-request — properties that matter when engines are actually slow, which is the
-real serving case.
+- **p50 improved**, 11.081 ms to a median of 6.282 ms (range 4.378–7.132).
+  Requests no longer queue for one of 16 fixed connection threads.
+- **p95 improved**, 20.213 ms to a median of 15.311 ms (range 13.007–18.210).
+  The ranges do not overlap.
+- **p99 improved**, 39.151 ms to a median of 23.772 ms — though this sample's
+  max is 43.721 ms, above the baseline, so the tail is not uniformly better run
+  to run.
+- **Throughput is higher**, 1,296 to a median of 2,139 req/s, with the baseline
+  below this sample's minimum of 1,840.
+
+**No throughput or latency win is claimed as a measured result**, because a
+one-run unlabelled baseline does not support one. What the migration is claimed
+to buy is cancellation safety, per-request timeouts, and a concurrency model
+that does not pin an OS thread per waiting request — properties that matter when
+engines are actually slow, which is the real serving case. It is worth noting
+that this benchmark's workload is trivial CPU arithmetic, so it flatters neither
+design: async overhead is a larger share of total time here than it would be
+with genuine model compute.
 
 See [benchmark methodology](docs/benchmark.md) for the harness details,
-including the Windows ephemeral-port exhaustion that makes back-to-back runs
-report false connection errors.
+including the Windows ephemeral-port exhaustion that degrades throughput and
+eventually reports false connection errors on back-to-back runs.
 
 ## Design and limits
 
@@ -235,8 +284,9 @@ report false connection errors.
 
 - Built a Rust inference control plane implementing Triton V2 HTTP endpoints,
   shape-aware dynamic batching, bounded admission/deadlines, model-version
-  reload, Prometheus metrics, and graceful shutdown; measured 1,296 CPU
-  requests/s with p95 20.2 ms across 2,000 requests.
+  reload, Prometheus metrics, and graceful shutdown on tokio/axum/tower;
+  measured a median 2,139 CPU requests/s (1,840–2,803 over 12 runs) with p95
+  15.3 ms across 2,000 requests per run.
 - Designed lease-based distributed worker routing with capacity-normalized
   least-load selection, KV-prefix affinity, heartbeat expiry, and
   phase-classified retries that replay only work proven not to have started.
