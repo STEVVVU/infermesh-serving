@@ -158,15 +158,31 @@ evidence.
 
 ## Verify
 
+These are the same commands CI runs, in the same order:
+
 ```powershell
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
+cargo test --benches                  # runs each criterion bench body once
 $env:PYTHONPATH="$PWD/python"
+python scripts/check_test_discovery.py python/tests 2
 python -m unittest discover -s python/tests -v
 python -m pip install "./python[onnx-test]"
+python scripts/check_test_discovery.py python/tests_onnx 1
 python -m unittest discover -s python/tests_onnx -v
 ```
+
+`cargo test --benches` exists because `--all-targets` compiles the criterion
+benches but never executes them, so a bench that panics could rot unnoticed.
+Timings from that run are meaningless and deliberately discarded.
+
+`check_test_discovery.py` guards a specific failure mode: `unittest discover`
+exits **0** when it discovers **zero** tests, so a mistyped path or a missing
+optional dependency yields a green "OK" that asserts nothing. The script
+asserts a minimum count and separately rejects discovery *errors*, since an
+unimportable module surfaces as a synthetic failing test that a plain count
+would otherwise accept.
 
 The deterministic suite covers compatible and incompatible batching,
 deadlines, saturated admission, repository reload, capacity and affinity

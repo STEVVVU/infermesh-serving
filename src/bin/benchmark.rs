@@ -211,6 +211,19 @@ async fn run(cli: Cli, server: Server) -> anyhow::Result<()> {
             "gpu_execution": false
         })
     );
+
+    // Exit non-zero if any request failed.
+    //
+    // Without this the harness always succeeded, so the CI smoke job printed a
+    // JSON blob reading `"successful": 0` and still went green — the benchmark
+    // equivalent of a test runner that discovers no tests. A smoke job exists
+    // to notice that the server stopped answering, so failures have to reach
+    // the exit status, not just the report.
+    anyhow::ensure!(
+        errors == 0,
+        "{errors} of {} requests failed; see the report above",
+        cli.operations
+    );
     Ok(())
 }
 

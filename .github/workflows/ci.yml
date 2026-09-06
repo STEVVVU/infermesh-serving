@@ -75,4 +75,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo run --release --bin infermesh-bench -- 200 8
+      # The harness now exits non-zero if any request failed, so this job fails
+      # rather than printing `"successful": 0` and going green. The grep is a
+      # belt-and-braces assertion on the report itself: a smoke job whose only
+      # signal is "the process ran" is the same vacuous pass as a test runner
+      # that discovers no tests. Timings here are meaningless on shared runners
+      # and are deliberately not recorded as benchmark results.
+      - run: cargo run --release --bin infermesh-bench -- 200 8 | tee bench.json
+      - run: grep -q '"errors":0' bench.json
