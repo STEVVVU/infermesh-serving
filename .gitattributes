@@ -1,0 +1,19 @@
+# Line endings are repo state, not a per-developer git setting.
+#
+# Without this file, whether a checkout gets LF or CRLF depends on each clone's
+# core.autocrlf. That matters here because benchmarks/*.json is committed
+# measurement evidence and CI greps it for `"errors":0`; re-flowing those bytes
+# per-platform would make a published measurement non-reproducible.
+* text eol=lf
+
+# Cargo.lock is text and must stay LF so it does not churn between platforms.
+Cargo.lock text eol=lf
+
+# Model weight formats the worker adapters load. None are tracked today --
+# model_repository/ holds only JSON descriptors, and README documents dropping
+# a model.onnx / model.pt in beside them -- but if one is ever committed the
+# `text` rule above would strip CR bytes out of it and corrupt the weights.
+*.onnx binary
+*.pt binary
+*.pth binary
+*.safetensors binary
