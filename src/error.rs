@@ -6,6 +6,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum ErrorCode {
     InvalidArgument,
     NotFound,
+    MethodNotAllowed,
     Unavailable,
     ResourceExhausted,
     DeadlineExceeded,
@@ -22,6 +23,7 @@ impl ErrorCode {
         match self {
             Self::InvalidArgument => 400,
             Self::NotFound => 404,
+            Self::MethodNotAllowed => 405,
             Self::ResourceExhausted => 429,
             Self::DeadlineExceeded => 408,
             Self::Unavailable => 503,

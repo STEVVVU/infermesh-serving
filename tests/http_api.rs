@@ -236,6 +236,65 @@ async fn triton_v2_contract_details_are_preserved() {
     harness.server.await.unwrap().unwrap();
 }
 
+/// A known path addressed with the wrong method must still answer in JSON.
+///
+/// This is a regression test with a specific mechanism behind it. axum resolves
+/// the path first, then hands the request to that path's `MethodRouter`, which
+/// answers an unmatched method from its *own* default fallback — a bare 405 with
+/// an empty body — without ever consulting the router-level `.fallback`. So the
+/// unknown-path test above passes while every method mismatch returns nothing a
+/// client reading `body["error"]` can parse. Both a GET-only and a POST-only
+/// route are covered, because the two reach the 405 through different registered
+/// method sets.
+#[tokio::test(flavor = "multi_thread")]
+async fn method_mismatch_on_a_known_route_is_a_json_error() {
+    let harness = start().await;
+    let address = harness.address;
+
+    // POST to a GET-only route.
+    let posted_to_get = request(address, "POST", "/v2", Some(json!({}))).await;
+    assert_eq!(posted_to_get.0, 405);
+    assert_eq!(
+        posted_to_get.1["error"],
+        json!("method not allowed for route")
+    );
+
+    // GET on a POST-only route, including one carrying path parameters.
+    let got_post_only = request(address, "GET", "/v2/models/adder/infer", None).await;
+    assert_eq!(got_post_only.0, 405);
+    assert_eq!(
+        got_post_only.1["error"],
+        json!("method not allowed for route")
+    );
+
+    let got_reload = request(address, "GET", "/v2/repository/reload", None).await;
+    assert_eq!(got_reload.0, 405);
+    assert!(got_reload.1["error"].is_string());
+
+    // A method the router knows nothing about lands in the same place.
+    let deleted_metrics = request(address, "DELETE", "/metrics", None).await;
+    assert_eq!(deleted_metrics.0, 405);
+    assert!(deleted_metrics.1["error"].is_string());
+
+    // The 405 keeps axum's derived `Allow` header, so the JSON body is an
+    // addition to the HTTP-level contract rather than a replacement for it.
+    let raw = raw_request(address, "POST", "/v2", Some(json!({}))).await;
+    assert!(raw.starts_with("HTTP/1.1 405"));
+    assert!(
+        raw.to_ascii_lowercase().contains("allow: get,head"),
+        "405 lost its Allow header: {raw}"
+    );
+
+    // A method mismatch must not be mistaken for a missing route: an unknown
+    // path is still the 404 `not_found` fallback.
+    let unrouted = request(address, "GET", "/v2/does-not-exist", None).await;
+    assert_eq!(unrouted.0, 404);
+    assert_eq!(unrouted.1["error"], json!("route not found"));
+
+    harness.shutdown.notify_one();
+    harness.server.await.unwrap().unwrap();
+}
+
 /// A per-request `timeout_us` must be honoured end to end over HTTP.
 #[tokio::test(flavor = "multi_thread")]
 async fn request_timeout_parameter_returns_request_timeout_status() {

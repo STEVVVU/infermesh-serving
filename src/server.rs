@@ -97,6 +97,18 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v2/control/shutdown", post(control_shutdown))
         .route("/metrics", get(metrics))
         .fallback(not_found)
+        // `.fallback` only covers paths that match *no* route. When the path
+        // matches but the method does not, the path's `MethodRouter` answers
+        // first from its own default fallback — a bare
+        // `Ok(StatusCode::METHOD_NOT_ALLOWED)` with an empty body — and
+        // `not_found` is never reached. An empty body breaks the one invariant
+        // every other error response here upholds, that a client can read
+        // `body["error"]`, so the method-mismatch case needs its own explicit
+        // JSON handler. Do not delete this as redundant with `.fallback`: the
+        // two cover disjoint cases, and `method_not_allowed_fallback` must stay
+        // after the routes it applies to, since it rewrites the already
+        // registered `MethodRouter`s.
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(middleware)
         .with_state(app)
@@ -237,6 +249,16 @@ async fn metrics(State(app): State<Arc<App>>) -> Response {
 
 async fn not_found() -> Error {
     Error::new(ErrorCode::NotFound, "route not found")
+}
+
+/// Answers a known path addressed with an unsupported method.
+///
+/// 405 is the accurate status — the resource exists — but the body must still be
+/// the `{"error": ...}` shape, which axum's built-in 405 is not. The `Allow`
+/// header axum derives from the path's registered methods is preserved: it is
+/// attached by the router around this response, not by the handler.
+async fn method_not_allowed() -> Error {
+    Error::new(ErrorCode::MethodNotAllowed, "method not allowed for route")
 }
 
 /// JSON body extractor that reports malformed input as `InvalidArgument`.

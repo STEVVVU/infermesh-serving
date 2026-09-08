@@ -35,9 +35,16 @@ transport and still bounded by the 4 MiB body limit, where the previous
 hand-rolled parser rejected them outright.
 
 Errors are returned as `{"error": "..."}` with the status implied by the
-control-plane error code (400 invalid argument, 404 not found, 408 deadline
-exceeded, 429 resource exhausted, 503 unavailable, 500 internal). An unparseable
-body is a 400, not a framework-default 422.
+control-plane error code (400 invalid argument, 404 not found, 405 method not
+allowed, 408 deadline exceeded, 429 resource exhausted, 503 unavailable, 500
+internal). An unparseable body is a 400, not a framework-default 422.
+
+Every error status carries that JSON body, including the two the framework would
+otherwise answer on its own: an unknown path is a 404 with
+`{"error": "route not found"}`, and a known path addressed with an unsupported
+method is a 405 with `{"error": "method not allowed for route"}` plus an `Allow`
+header naming the methods that path does accept. A client may therefore read
+`body["error"]` on any non-2xx response without first special-casing the status.
 
 ## Engine protocol
 
